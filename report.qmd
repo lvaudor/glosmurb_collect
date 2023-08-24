@@ -1,0 +1,138 @@
+---
+title: "OSM_rivers"
+format: html
+editor: visual
+execute:
+  echo: false
+  warning: false
+---
+
+# Prepare analysis
+
+## Load packages
+
+```{r packages}
+library(tidyverse)
+library(glosmurb)
+library(sf)
+```
+
+## Study areas
+
+```{r}
+study_areas=sf::st_read("../glosmurb_collect/data/study_areas_temp/study_areas_20230713_buffer.shp")
+```
+
+## Key-Value
+
+This table, loaded through package glosmurb, corresponds to all key-values associations that are searched inside a shape. 
+
+*See how to include documentation for a dataset => cf formation ThinkR Rcheck_helper?*
+
+```{r show_key_value}
+tib_key_value
+```
+
+## Shapes
+
+```{r shapes_in_envir}
+shapes_in_envir=function(shape_name){
+ shape=study_areas %>% 
+      filter(Name==shape_name) %>% 
+      st_as_sfc() %>% 
+      st_transform(crs=crs_osmdata)
+    assign(shape_name,shape,envir=globalenv())
+}
+study_areas$Name %>% 
+  purrr::map(shapes_in_envir)
+```
+
+# Collect data
+
+## save_osm_results()
+
+Function save_osm_results(shape_name) gets (possibly through reading pre-saved files here) all OSM data for each key-value association considered for a particular shape.
+
+```{r save_osm_results}
+save_osm_results=function(shape_name){
+    glosmurb::tib_key_value %>% 
+      mutate(result=purrr::map2(.x=key,.y=value,
+                                .f=get_osmdata,
+                                shape_name=shape_name,
+                                save=TRUE,
+                                return=FALSE))
+    return(tib_key_value)
+}
+study_areas$Name %>%
+  purrr::map(save_osm_results)
+
+```
+
+## mapinfo_shape()
+
+The function mapinfo_shape() builds a table which gathers all information relevant for the subsequent building of the leaflet map, i.e. the geometry, label (value), group (kind of social stake), detail provided by popup windows in the leaflet map, etc.
+
+```{r}
+mapinfo_shape=function(shape_name, save=FALSE, dir_name="data/mapinfo"){
+  mapinfo_file=glue::glue("{dir_name}/mapinfo_{shape_name}.RDS")
+  if(file.exists(mapinfo_file)){
+    mapinfo=readRDS(mapinfo_file)
+  }else{
+    mapinfo=tib_key_value %>% 
+      mutate(osmdata=purrr::map2(.x=key,.y=value,.f=get_osmdata,
+                                 return=TRUE, save=FALSE, shape_name=shape_name))%>%
+      mutate(osmdata=purrr::map2(.x=osmdata,.y=geom,.f=pick_osmdata))  %>%
+      mutate(osmdata=purrr::map(.x=osmdata,.f=detail_element)) %>% 
+      mutate(nelems=purrr::map_int(.x=osmdata,
+                                   ~if(is.null(.x)){return(0)}else{return(nrow(.x))})) %>% 
+      mutate(value=glue::glue("{value} n={nelems}"))
+  }
+  if(save){
+      if(!dir.exists(dir_name)){dir.create(dir_name)}
+        saveRDS(mapinfo,mapinfo_file)
+  }
+  return(mapinfo)
+}
+mapinfo=tibble::tibble(shape_name=study_areas$Name) %>%
+  group_by(shape_name) %>% 
+  nest() %>% 
+  mutate(data=purrr::map(.x=shape_name,.f=mapinfo_shape,save=TRUE)) %>% 
+  mutate(data=purrr::map(data,~select(.x,-osmdata))) %>% 
+  unnest(cols=c("data")) %>% 
+  ungroup()
+
+```
+
+## build_map_shape()
+
+Function build_map_shape() runs mapinfo_shape() and then builds leaflet map.
+
+```{r}
+build_map_shape=function(shape_name, save=FALSE, dir_name="data/maps"){
+  mapinfo=mapinfo_shape(shape_name, save=FALSE, dir_name=dir_name) %>% 
+    filter(!is.null(osmdata))
+  mymap=leaflet::leaflet(shape_name) %>% 
+      leaflet::addPolygons(data=get(shape_name),fill=FALSE,color="red")
+  for (i in 1:nrow(mapinfo)){mymap=mymap %>% 
+    add_to_map(mapinfo$osmdata[i][[1]],
+               color=mapinfo$color[i],
+               layergroup=mapinfo$group[i])
+  }
+
+   map_file=glue::glue("{dir_name}/map_{shape_name}.RDS")
+   if(save){
+      if(!dir.exists(dir_name)){dir.create(dir_name)}
+        saveRDS(mymap,map_file)
+      return(glue::glue("Saved as {map_file}"))
+  }else{
+    return(mymap)
+  }
+}
+mymap=build_map_shape("Ahmedabad", save=FALSE)
+
+
+study_areas$Name %>%
+  purrr::map(build_map_shape,save=TRUE)
+```
+
+
