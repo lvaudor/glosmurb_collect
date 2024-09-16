@@ -11,40 +11,45 @@ execute:
 
 ## Load packages
 
-```{r packages}
+```{r setup}
 library(tidyverse)
 library(glosmurb)
 library(sf)
-```
+areas=sf::st_read("data/study_area_global.shp") %>% 
+   sf::st_transform(crs=4326) %>% 
+   mutate(name=paste0("shp_",CityCode)) %>% 
+   mutate(path=paste0("data/study_areas/",name,".shp")) %>% 
+   mutate(path_results=paste0("data/osmdata/",name))
 
-## Study areas
+if(!file.exists("data/study_areas")){
+dir.create("data/study_areas")
+areas_wr=areas %>% 
+  group_by(path) %>% 
+  tidyr::nest() %>% 
+  mutate(data=purrr::map2(.x=data,.y=path,~sf::st_write(obj=.x,dsn=.y,delete_dsn=TRUE)))
+}
 
-```{r}
-study_areas=sf::st_read("../glosmurb_collect/data/study_areas_temp/study_areas_20230713_buffer.shp")
+db_con <- function(){
+  db_con <- DBI::dbConnect(RPostgres::Postgres(),
+                           host = Sys.getenv("SANDBOX_HOST"),
+                           port = Sys.getenv("SANDBOX_PORT"),
+                           dbname = Sys.getenv("SANDBOX_NAME"),
+                           user      = Sys.getenv("SANDBOX_USER_APP"),
+                           password  = Sys.getenv("SANDBOX_PASS_APP"))
+  return(db_con)
+}
+
+tib_key_value=glosmurb::tib_key_value %>% filter(key!="seamark:type")
 ```
 
 ## Key-Value
 
-This table, loaded through package glosmurb, corresponds to all key-values associations that are searched inside a shape. 
+This table, loaded through package glosmurb, corresponds to all key-values associations that are searched inside a shape.
 
-*See how to include documentation for a dataset => cf formation ThinkR Rcheck_helper?*
+*See how to include documentation for a dataset =\> cf formation ThinkR Rcheck_helper?*
 
-```{r show_key_value}
+```{r}
 tib_key_value
-```
-
-## Shapes
-
-```{r shapes_in_envir}
-shapes_in_envir=function(shape_name){
- shape=study_areas %>% 
-      filter(Name==shape_name) %>% 
-      st_as_sfc() %>% 
-      st_transform(crs=crs_osmdata)
-    assign(shape_name,shape,envir=globalenv())
-}
-study_areas$Name %>% 
-  purrr::map(shapes_in_envir)
 ```
 
 # Collect data
@@ -55,53 +60,246 @@ Function save_osm_results(shape_name) gets (possibly through reading pre-saved f
 
 ```{r save_osm_results}
 save_osm_results=function(shape_name){
-    glosmurb::tib_key_value %>% 
-      mutate(result=purrr::map2(.x=key,.y=value,
-                                .f=get_osmdata,
-                                shape_name=shape_name,
-                                save=TRUE,
-                                return=FALSE))
-    return(tib_key_value)
+    shape=areas %>% 
+      filter(name==shape_name) %>% 
+      st_as_sfc() %>% 
+      st_transform(crs=crs_osmdata)
+    purrr::map2(.x=tib_key_value$key,
+                .y=tib_key_value$value,
+                .f=save_osmdata,
+                shape_name=shape_name)
+    result=paste0(shape_name,"done")
+   return(result)
 }
-study_areas$Name %>%
-  purrr::map(save_osm_results)
-
 ```
 
-## mapinfo_shape()
-
-The function mapinfo_shape() builds a table which gathers all information relevant for the subsequent building of the leaflet map, i.e. the geometry, label (value), group (kind of social stake), detail provided by popup windows in the leaflet map, etc.
+# Run save_osmdata
 
 ```{r}
-mapinfo_shape=function(shape_name, save=FALSE, dir_name="data/mapinfo"){
-  mapinfo_file=glue::glue("{dir_name}/mapinfo_{shape_name}.RDS")
-  if(file.exists(mapinfo_file)){
-    mapinfo=readRDS(mapinfo_file)
-  }else{
-    mapinfo=tib_key_value %>% 
-      mutate(osmdata=purrr::map2(.x=key,.y=value,.f=get_osmdata,
-                                 return=TRUE, save=FALSE, shape_name=shape_name))%>%
-      mutate(osmdata=purrr::map2(.x=osmdata,.y=geom,.f=pick_osmdata))  %>%
-      mutate(osmdata=purrr::map(.x=osmdata,.f=detail_element)) %>% 
-      mutate(nelems=purrr::map_int(.x=osmdata,
-                                   ~if(is.null(.x)){return(0)}else{return(nrow(.x))})) %>% 
-      mutate(value=glue::glue("{value} n={nelems}"))
+for(i in 121:130){# pb: 39,59,106,112 (166 trop volumineux),168, 172 185, 190, (252 trop vol, 253 pareil)
+  print(i)
+  print(areas[i,])
+  save_osm_results(areas$path[i])
   }
-  if(save){
-      if(!dir.exists(dir_name)){dir.create(dir_name)}
-        saveRDS(mapinfo,mapinfo_file)
-  }
-  return(mapinfo)
+```
+
+# Dispatch osmdata layers in zones
+
+```{r}
+StudyArea_reach_zone=st_read("data/StudyArea_reach_zone.shp") %>% 
+  dplyr::select(-layer,-path,-ID)
+
+
+    
+dispatch_osmdata_in_zones=function(path,myCityCode){
+      osm_shape=sf::st_read(path,quiet=TRUE) %>% 
+        sf::st_make_valid()
+    new_path=stringr::str_replace(path,"/osmdata/","/osmdata_trimmed/")
+    if(file.exists(new_path)){return("Done")}
+    sf::sf_use_s2(FALSE)
+     our_shape=StudyArea_reach_zone %>%
+       filter(CityCode==myCityCode) %>% 
+       sf::st_make_valid() 
+     intersect_shape=function(shape){
+       intersects=sf::st_intersects(osm_shape,shape,sparse=FALSE)
+       result=osm_shape %>%
+         dplyr::mutate(intersects=intersects) %>%
+         dplyr::filter(intersects==TRUE) %>% 
+         dplyr::select(-intersects) %>% 
+         dplyr::mutate(data=purrr::map(osm_id,function(x){shape %>% st_drop_geometry()})) %>% 
+         tidyr::unnest(cols=c("data"))
+       return(result)
+     }
+     our_shapes=our_shape %>% 
+       mutate(npol=1:n()) %>% 
+       group_by(npol) %>% 
+       tidyr::nest() %>% 
+       dplyr::mutate(data=purrr::map(data,intersect_shape)) %>% 
+       sf::st_drop_geometry()
+     result=do.call(rbind,our_shapes$data)
+     new_path=stringr::str_replace(path,"/osmdata/","/osmdata_trimmed/")
+     directory=stringr::str_replace(new_path,"[^\\/]*\\.shp","")
+     if(!dir.exists(directory)){dir.create(directory,recursive=TRUE)}
+     sf::st_write(result,dsn=new_path,quiet=TRUE)
+     return("Done")
 }
-mapinfo=tibble::tibble(shape_name=study_areas$Name) %>%
-  group_by(shape_name) %>% 
-  nest() %>% 
-  mutate(data=purrr::map(.x=shape_name,.f=mapinfo_shape,save=TRUE)) %>% 
-  mutate(data=purrr::map(data,~select(.x,-osmdata))) %>% 
-  unnest(cols=c("data")) %>% 
-  ungroup()
+
+
+# 
+# path="data/osmdata/shp_2478815_21602/landuse-farmland-osm_points.shp"  
+# myCityCode="2478815_21602"
+#dispatch_osmdata_in_zones(path,myCityCode)
+# truc=sf::st_read("data/osmdata_trimmed/shp_1087683_20019/natural-wood-osm_polygons.shp")
+```
+
+```{r}
+available_osmdata_directories=list.files("data/osmdata") 
+dispatch_osmdata_in_zones_one_directory=function(one_directory){
+  shp=list.files(paste0("data/osmdata/",one_directory)) %>% 
+    str_subset("\\.shp$")
+  shp=paste0("data/osmdata/",one_directory,"/",shp)  
+  thisCityCode=str_extract(one_directory,"(?<=shp_).*$")
+  purrr::map(shp,dispatch_osmdata_in_zones,myCityCode=thisCityCode)
+}
+purrr::map(available_osmdata_directories,dispatch_osmdata_in_zones_one_directory)
+```
+
+# Add to DataBase
+
+
+```{r}
+conn=db_con()
+StudyArea_reach_zone=st_read("data/StudyArea_reach_zone.shp") %>% 
+  dplyr::select(-layer,-path,-ID)
+sf::st_write(StudyArea_reach_zone,dsn=conn,layer="StudyArea_reach_zone")
+DBI::dbDisconnect(conn)
+```
+
+# Put in SandBox database
+
+```{r}
+append_to_table_city <- function(CityCode,
+                              type,
+                              conn, 
+                              check=TRUE){
+  
+  # Check if table has already been added
+  if(check==TRUE){
+    query = glue::glue("SELECT * FROM {type} WHERE citycode = '{CityCode}';")
+    result <- dbGetQuery(conn, query)
+    if(nrow(result)>0){return()}
+  }
+  dir=paste0("data/osmdata_trimmed/shp_",CityCode)
+  tib_shp=tibble::tibble(path=list.files(dir) %>% str_subset(paste0(type,".shp$"))) %>% 
+    mutate(osm_keyvalue=str_replace(path,paste0("-",type,".shp"),"")) %>% 
+    mutate(path=paste0(dir,"/",path)) 
+  read_and_write_shp=function(path,osm_keyvalue,CityCode){
+    shp=sf::st_read(path, quiet=TRUE) %>% 
+      mutate(citycode=CityCode,
+             osm_keyvalue=osm_keyvalue) %>% 
+      select(citycode,osm_keyvalue)
+    sf::st_write(shp,dsn=conn,layer=type,append=TRUE,quiet=TRUE)
+  }
+  tib_shp %>% 
+    mutate(purrr::pmap(list(path,osm_keyvalue,CityCode),read_and_write_shp))
+  return(glue::glue("{type} have been added to DB table for city {CityCode}"))
+}
+
+library(DBI)
+conn=db_con()
+append_to_table_city(CityCode="891417_21715",type="osm_points",conn, check=FALSE)
+append_to_table_city(CityCode="891417_21715",type="osm_polygons",conn, check=FALSE)
+append_to_table_city(CityCode="891417_21715",type="osm_lines",conn, check=FALSE)
+append_to_table_city(CityCode="891417_21715",type="osm_multipolygons",conn, check=FALSE)
+append_to_table_city(CityCode="891417_21715",type="osm_multilines",conn, check=FALSE)
+dbDisconnect(conn)
 
 ```
+
+```{r}
+available_osmdata_directories=list.files("data/osmdata_trimmed")
+treat_one_directory=function(one_directory){
+  thisCityCode=str_extract(one_directory,"(?<=shp_).*$")
+  print(thisCityCode)
+  append_to_table_city(CityCode=thisCityCode,type="osm_points",conn)
+  append_to_table_city(CityCode=thisCityCode,type="osm_lines",conn)
+  append_to_table_city(CityCode=thisCityCode,type="osm_polygons",conn)
+  append_to_table_city(CityCode=thisCityCode,type="osm_multipolygons",conn)
+}
+conn=db_con()
+available_osmdata_directories[51:120] %>%  
+  purrr::map(treat_one_directory)
+dbDisconnect(conn)
+```
+
+```{r}
+# upsert_talweg_metrics <- function(dataset = talweg_metrics,
+#                                   table_name = "talweg_metrics",
+#                                   db_con,
+#                                   field_identifier = "axis"){
+# 
+#   remove_rows(dataset = dataset,
+#               field_identifier = field_identifier,
+#               table_name = table_name)
+# 
+#   dbWriteTable(conn = db_con, name = table_name, value = dataset, append = TRUE)
+# 
+#   rows_insert <- nrow(dataset)
+# 
+#   dbDisconnect(db_con)
+# 
+#   return(glue::glue("{table_name} updated with {rows_insert} inserted"))
+# }
+```
+
+
+# Gather Wikidata
+
+```{r}
+get_wikidata_csv=function(one_path_results){
+  csv_file=paste0(one_path_results,"/wikidata.csv")
+  if(file.exists(csv_file)){
+    result=readr::read_csv(csv_file,col_names=FALSE)
+    colnames(result)=c("osm_id","wikidata_id","key","value","type")
+  }else{result=NULL}
+  return(result)
+}
+wikidata=areas %>% 
+  head(120) %>% 
+  mutate(wikidata=purrr::map(path_results,get_wikidata_csv)) %>%  
+  st_drop_geometry() %>% 
+  select(CityCode,UrbanAggl,wikidata) %>% 
+  tidyr::unnest(cols=c("wikidata"))
+write_csv2(wikidata,"data/wikidata.csv")
+wikidata_summary=wikidata %>% select(osm_id,key,value,type) %>% unique() %>% group_by(key,value) %>% summarise(n=n())
+
+```
+
+# Describe OSM data
+
+```{r}
+describe_osmdata_item=function(one_path_results,key,value){
+  get_shp_summary=function(path, type){
+    if(file.exists(path)){
+      shape=sf::st_read(path,quiet=TRUE) 
+      if(type=="osm_points"){size=nrow(shape)}
+      if(type %in% c("osm_lines","osm_multilines")){size=shape  %>% sf::st_make_valid() %>% sf::st_length() %>%  as.numeric() %>% sum()}
+      if(type %in% c("osm_polygons","osm_multipolygons")){size=shape %>% sf::st_make_valid() %>%   sf::st_area() %>% as.numeric() %>% sum()}
+      result=tibble::tibble(n_items=nrow(shape),
+                            size=size)
+    }else{result=tibble::tibble(n_items=0,size=0)}
+    return(result)
+  }
+  result=tibble::tibble(
+    type=c("osm_points",
+            "osm_lines",
+            "osm_polygons",
+            "osm_multilines",
+            "osm_multipolygons")) %>%
+    dplyr::mutate(shp_path=glue::glue("{one_path_results}/{key}-{value}-{type}.shp")) %>%
+    dplyr::mutate(result=purrr::map2(shp_path,type,get_shp_summary)) %>% 
+    tidyr::unnest(cols=c("result"))
+  return(result)
+}
+describe_osmdata_item("data/osmdata/shp_2453450_204024",key="landuse","grass")
+```
+
+```{r}
+summary_osmdata=areas %>% 
+  head(15) %>% 
+  dplyr::mutate(data=purrr::map(name,function(x){return(tib_key_value)})) %>% 
+  tidyr::unnest(cols=c("data")) %>% 
+  dplyr::mutate(data=purrr::pmap(list(path_results,key,value),describe_osmdata_item)) %>% 
+  tidyr::unnest(cols=c("data")) %>% 
+  dplyr::filter(geom==type,
+                n_items>0) %>% 
+  dplyr::select(shp_path,CityCode,UrbanAggl,key,value,group,geom,color,n_items,size)
+saveRDS(summary_osmdata,"data/summary_osmdata.RDS")
+
+areas_zone_reach=st_read("data/StudyArea_reach_zone.shp")
+areas$path_results
+```
+
 
 ## build_map_shape()
 
@@ -128,11 +326,99 @@ build_map_shape=function(shape_name, save=FALSE, dir_name="data/maps"){
     return(mymap)
   }
 }
-mymap=build_map_shape("Ahmedabad", save=FALSE)
 
 
-study_areas$Name %>%
+areas %>%
+  slice(c(-39,-59,-106)) %>% 
+  head(110) %>% 
+  pull(name) %>% 
   purrr::map(build_map_shape,save=TRUE)
 ```
 
+```{r}
+readRDS("data/maps/map_shp_1913384_20333.RDS")
+```
 
+<!-- # mapinfo_shape() -->
+
+<!-- The function mapinfo_shape() builds a table which gathers all information relevant for the subsequent building of the leaflet map, i.e. the geometry, label (value), group (kind of social stake), detail provided by popup windows in the leaflet map, etc. -->
+
+<!-- ```{r} -->
+
+<!-- mapinfo_shape=function(shape_name, save=FALSE, dir_name="data/mapinfo"){ -->
+
+<!--   mapinfo_file=glue::glue("{dir_name}/mapinfo_{shape_name}.RDS") -->
+
+<!--   if(file.exists(mapinfo_file)){ -->
+
+<!--     mapinfo=readRDS(mapinfo_file) -->
+
+<!--   }else{ -->
+
+<!--     mapinfo=tib_key_value %>%  -->
+
+<!--       mutate(osmdata=purrr::map2(.x=key,.y=value,.f=get_osmdata, -->
+
+<!--                                  return=TRUE, save=FALSE, shape_name=shape_name))%>% -->
+
+<!--       mutate(osmdata=purrr::map2(.x=osmdata,.y=geom,.f=pick_osmdata))  %>% -->
+
+<!--       mutate(osmdata=purrr::map(.x=osmdata,.f=detail_element)) %>%  -->
+
+<!--       mutate(nelems=purrr::map_int(.x=osmdata, -->
+
+<!--                                    ~if(is.null(.x)){return(0)}else{return(nrow(.x))})) %>%  -->
+
+<!--       mutate(value=glue::glue("{value} n={nelems}")) -->
+
+<!--   } -->
+
+<!--   if(save){ -->
+
+<!--       if(!dir.exists(dir_name)){dir.create(dir_name)} -->
+
+<!--         saveRDS(mapinfo,mapinfo_file) -->
+
+<!--   }  -->
+
+<!--   return(mapinfo) -->
+
+<!-- } -->
+
+<!-- #file.remove(list.files("data/mapinfo")) # comment if tib_key_value unchanged, just new cities added -->
+
+<!-- map_elems_global=areas %>% -->
+
+<!--   slice(c(-39,-59,-106,-112,-166,-168,-172,-185)) %>%  -->
+
+<!--   head(188) %>%  -->
+
+<!--   group_by(CityCode,UrbanAggl,name) %>%  -->
+
+<!--   nest() %>%  -->
+
+<!--   mutate(data=purrr::map(.x=name,.f=mapinfo_shape,save=TRUE)) %>%  -->
+
+<!--   mutate(data=purrr::map(data,~select(.x,-osmdata))) %>%  -->
+
+<!--   unnest(cols=c("data")) %>%  -->
+
+<!--   ungroup() -->
+
+<!-- saveRDS(map_elems_global, "data/map_elems_global.RDS") -->
+
+<!-- #saveRDS(map_elems_global, "../glourbapp/data-raw/map_elems_global.RDS") -->
+
+<!-- mapinfo_files=list.files("data/mapinfo") -->
+
+<!-- for (i in 1:length(mapinfo_files)){ -->
+
+<!--   file.copy(from=paste0("data/mapinfo/",mapinfo_files[i]), -->
+
+<!--             to=paste0("../glourbapp/inst/mapinfo/",mapinfo_files[i]), -->
+
+<!--             overwrite=TRUE) -->
+
+<!-- } -->
+
+<!-- ``` -->
